@@ -66,7 +66,7 @@ async fn fetch_and_cache_channel_hashes(client: &Client, target_channel_id: i64)
     let mut offset_peer = tl::enums::InputPeer::Empty;
 
     for _ in 0..MAX_PAGES {
-        let result = client
+        let result = match client
             .invoke(&tl::functions::messages::GetDialogs {
                 exclude_pinned: false,
                 folder_id: None,
@@ -77,7 +77,16 @@ async fn fetch_and_cache_channel_hashes(client: &Client, target_channel_id: i64)
                 hash: 0,
             })
             .await
-            .ok()?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "GetDialogs failed while resolving channel {}: {}",
+                    target_channel_id, e
+                );
+                return None;
+            }
+        };
 
         // Extract everything we need while the borrow of `result` is live.
         let (is_complete, batch_count, next_offset) = {
@@ -300,9 +309,16 @@ pub async fn resolve_peer_from_str(client: &Client, chat_id: &str) -> Option<tl:
                 let channel_id = abs - 1_000_000_000;
                 // Resolve real access_hash; without it Telegram rejects requests
                 // for private channels even when the session has membership.
-                let access_hash = resolve_channel_access_hash(client, channel_id)
-                    .await
-                    .unwrap_or(0);
+                let access_hash = match resolve_channel_access_hash(client, channel_id).await {
+                    Some(h) => h,
+                    None => {
+                        warn!(
+                            "access_hash for channel {} not found in dialogs (not a member, or dialog scan failed); using 0",
+                            channel_id
+                        );
+                        0
+                    }
+                };
                 return Some(tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
                     channel_id,
                     access_hash,
@@ -478,7 +494,7 @@ pub async fn get_location_from_message_id(
     let input_msg = tl::enums::InputMessage::Id(tl::types::InputMessageId { id: message_id });
 
     let result = match &peer {
-        tl::enums::InputPeer::Channel(ch) => client
+        tl::enums::InputPeer::Channel(ch) => match client
             .invoke(&tl::functions::channels::GetMessages {
                 channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
                     channel_id: ch.channel_id,
@@ -487,13 +503,31 @@ pub async fn get_location_from_message_id(
                 id: vec![input_msg],
             })
             .await
-            .ok()?,
-        _ => client
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "channels.GetMessages failed (channel={}, hash_is_zero={}, msg={}): {}",
+                    ch.channel_id,
+                    ch.access_hash == 0,
+                    message_id,
+                    e
+                );
+                return None;
+            }
+        },
+        _ => match client
             .invoke(&tl::functions::messages::GetMessages {
                 id: vec![input_msg],
             })
             .await
-            .ok()?,
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("messages.GetMessages failed (msg={}): {}", message_id, e);
+                return None;
+            }
+        },
     };
 
     let loc = extract_file_location_from_msgs(&result);
