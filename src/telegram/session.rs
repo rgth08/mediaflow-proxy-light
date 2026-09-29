@@ -220,6 +220,12 @@ pub fn parse_telethon_session(s: &str) -> Option<(i32, SocketAddr, [u8; 256])> {
     Some((dc_id, addr, auth_key))
 }
 
+#[cfg(feature = "telegram")]
+static RECONNECT_POLICY: grammers_client::FixedReconnect = grammers_client::FixedReconnect {
+    attempts: 5,
+    delay: std::time::Duration::from_secs(1),
+};
+
 /// Create a grammers `Client` from a Telethon session string.
 #[cfg(feature = "telegram")]
 async fn init_client(cfg: &TelegramConfig) -> Result<Client, String> {
@@ -244,6 +250,10 @@ async fn init_client(cfg: &TelegramConfig) -> Result<Client, String> {
         api_hash: cfg.api_hash.clone(),
         params: InitParams {
             catch_up: false,
+            // grammers defaults to NoReconnect: once Telegram closes an idle TCP
+            // connection ("read 0 bytes") every later request fails. Reconnect
+            // automatically instead.
+            reconnection_policy: &RECONNECT_POLICY,
             ..Default::default()
         },
     })
@@ -304,9 +314,9 @@ pub async fn resolve_peer_from_str(client: &Client, chat_id: &str) -> Option<tl:
     if let Ok(id) = stripped.parse::<i64>() {
         if id < 0 {
             let abs = -id;
-            if abs > 1_000_000_000 {
+            if abs > 1_000_000_000_000 {
                 // -100XXXXXXXXXX → supergroup / channel
-                let channel_id = abs - 1_000_000_000;
+                let channel_id = abs - 1_000_000_000_000;
                 // Resolve real access_hash; without it Telegram rejects requests
                 // for private channels even when the session has membership.
                 let access_hash = match resolve_channel_access_hash(client, channel_id).await {
