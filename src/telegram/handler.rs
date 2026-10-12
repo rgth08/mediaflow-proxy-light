@@ -6,6 +6,7 @@
 //! - `GET  /proxy/telegram/stream/{filename}`  — same, cosmetic filename variant
 //! - `HEAD /proxy/telegram/stream/{filename}`  — same, no body
 //! - `GET  /proxy/telegram/info`               — get metadata
+//! - `GET  /proxy/telegram/list`               — list the chat's video documents (catalog)
 //! - `GET  /proxy/telegram/status`             — session status
 
 use std::collections::HashMap;
@@ -364,6 +365,98 @@ pub async fn telegram_info_handler(
         "url": url,
         "parsed": format!("{media_ref:?}"),
     })))
+}
+
+// ---------------------------------------------------------------------------
+// List handler (catalog support)
+// ---------------------------------------------------------------------------
+
+/// List the video documents of a chat, so a client can build a catalog.
+///
+/// Query: `chat_id` (required), `min_id` (optional; only messages newer than this id),
+/// `limit` (optional; max messages to inspect, default 3000, clamped to 100..=20000).
+///
+/// Response: `{ chat_id, min_id, top_id, count, scanned, truncated, items: [...] }`
+/// where each item is `{ id, name, size, duration, date, mime }`. Feed `top_id` back as the
+/// next `min_id` to fetch only what was posted afterwards.
+pub async fn telegram_list_handler(
+    req: HttpRequest,
+    config: web::Data<Arc<Config>>,
+    metrics: web::Data<Arc<AppMetrics>>,
+) -> AppResult<HttpResponse> {
+    metrics.inc_request();
+    metrics.telegram_requests.fetch_add(1, Ordering::Relaxed);
+
+    let query: HashMap<String, String> =
+        web::Query::<HashMap<String, String>>::from_query(req.query_string())
+            .map(|q| q.into_inner())
+            .unwrap_or_default();
+
+    let chat_id = query
+        .get("chat_id")
+        .cloned()
+        .ok_or_else(|| AppError::BadRequest("Missing chat_id".into()))?;
+    let min_id: i32 = query
+        .get("min_id")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+        .max(0);
+    let limit: usize = query
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000)
+        .clamp(100, 20000);
+
+    let tg_cfg = &config.telegram;
+    if tg_cfg.api_id == 0 || tg_cfg.api_hash.is_empty() || tg_cfg.session_string.is_empty() {
+        return Err(AppError::Telegram(
+            "Telegram not configured. Set APP__TELEGRAM__API_ID, \
+             APP__TELEGRAM__API_HASH and APP__TELEGRAM__SESSION_STRING."
+                .into(),
+        ));
+    }
+
+    #[cfg(not(feature = "telegram"))]
+    return Err(AppError::Telegram(
+        "Telegram feature not compiled in.".into(),
+    ));
+
+    #[cfg(feature = "telegram")]
+    {
+        use crate::telegram::session::{get_or_init_client, list_channel_videos};
+
+        let client = get_or_init_client(tg_cfg)
+            .await
+            .map_err(|e| AppError::Telegram(format!("Telegram connect failed: {}", e)))?;
+        let listing = list_channel_videos(client, &chat_id, min_id, limit)
+            .await
+            .map_err(AppError::Telegram)?;
+
+        let items: Vec<serde_json::Value> = listing
+            .videos
+            .iter()
+            .map(|v| {
+                serde_json::json!({
+                    "id": v.id,
+                    "name": v.name,
+                    "size": v.size,
+                    "duration": v.duration,
+                    "date": v.date,
+                    "mime": v.mime,
+                })
+            })
+            .collect();
+
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "chat_id": chat_id,
+            "min_id": min_id,
+            "top_id": listing.top_id,
+            "count": items.len(),
+            "scanned": listing.scanned,
+            "truncated": listing.truncated,
+            "items": items,
+        })))
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -703,6 +703,207 @@ pub async fn get_fresh_document_info(
 }
 
 // ---------------------------------------------------------------------------
+// Channel video listing (catalog support)
+// ---------------------------------------------------------------------------
+
+/// A video-like document found in a chat's history.
+#[cfg(feature = "telegram")]
+#[derive(Debug, Clone)]
+pub struct ChannelVideo {
+    pub id: i32,
+    pub name: String,
+    pub size: i64,
+    pub duration: i64,
+    pub date: i32,
+    pub mime: String,
+}
+
+/// Result of [`list_channel_videos`].
+#[cfg(feature = "telegram")]
+#[derive(Debug, Clone)]
+pub struct ChannelListing {
+    pub videos: Vec<ChannelVideo>,
+    /// Highest message id seen (any kind of message), or `min_id` when nothing is newer.
+    pub top_id: i32,
+    /// Number of messages inspected.
+    pub scanned: usize,
+    /// True when `max_scan` stopped the walk before reaching the oldest message.
+    pub truncated: bool,
+}
+
+#[cfg(feature = "telegram")]
+const VIDEO_EXTS: [&str; 7] = [".mp4", ".mkv", ".m4v", ".mov", ".avi", ".webm", ".ts"];
+
+#[cfg(feature = "telegram")]
+fn tl_message_id(m: &tl::enums::Message) -> i32 {
+    match m {
+        tl::enums::Message::Empty(e) => e.id,
+        tl::enums::Message::Message(m) => m.id,
+        tl::enums::Message::Service(s) => s.id,
+    }
+}
+
+/// Build a [`ChannelVideo`] from a message when it carries a video document.
+#[cfg(feature = "telegram")]
+fn video_from_message(m: &tl::types::Message) -> Option<ChannelVideo> {
+    let md = match &m.media {
+        Some(tl::enums::MessageMedia::Document(md)) => md,
+        _ => return None,
+    };
+    let doc = match &md.document {
+        Some(tl::enums::Document::Document(d)) => d,
+        _ => return None,
+    };
+    let file_name = doc.attributes.iter().find_map(|attr| match attr {
+        tl::enums::DocumentAttribute::Filename(f) => Some(f.file_name.clone()),
+        _ => None,
+    });
+    let duration = doc
+        .attributes
+        .iter()
+        .find_map(|attr| match attr {
+            tl::enums::DocumentAttribute::Video(v) => Some(v.duration as i64),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let is_video_mime = doc.mime_type.starts_with("video/");
+    let ext_ok = file_name
+        .as_deref()
+        .map(|n| {
+            let lower = n.to_lowercase();
+            VIDEO_EXTS.iter().any(|e| lower.ends_with(e))
+        })
+        .unwrap_or(false);
+    if !(is_video_mime || ext_ok) {
+        return None;
+    }
+    let name = file_name
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| {
+            let first = m.message.lines().next().unwrap_or("").trim().to_string();
+            if first.is_empty() {
+                None
+            } else {
+                Some(first)
+            }
+        })
+        .unwrap_or_else(|| format!("mensaje-{}", m.id));
+    Some(ChannelVideo {
+        id: m.id,
+        name,
+        size: doc.size as i64,
+        duration,
+        date: m.date,
+        mime: doc.mime_type.clone(),
+    })
+}
+
+/// List the video documents of `chat_id` whose message id is greater than `min_id`
+/// (`0` = whole history), walking the history newest-first in batches of 100.
+///
+/// With `min_id` set to the previous `top_id`, a refresh costs a single request
+/// when nothing new was posted.
+#[cfg(feature = "telegram")]
+pub async fn list_channel_videos(
+    client: Arc<Client>,
+    chat_id: &str,
+    min_id: i32,
+    max_scan: usize,
+) -> Result<ChannelListing, String> {
+    let peer = resolve_peer_from_str(&client, chat_id)
+        .await
+        .ok_or_else(|| format!("No se pudo resolver el chat {}", chat_id))?;
+
+    let batch = 100i32;
+    let mut offset_id = 0i32;
+    let mut videos: Vec<ChannelVideo> = Vec::new();
+    let mut top_id = min_id;
+    let mut scanned = 0usize;
+    let mut truncated = false;
+
+    loop {
+        // Retry on transient IO disconnects (grammers "read 0 bytes")
+        let mut attempt = 0u32;
+        let result = loop {
+            let r = client
+                .invoke(&tl::functions::messages::GetHistory {
+                    peer: peer.clone(),
+                    offset_id,
+                    offset_date: 0,
+                    add_offset: 0,
+                    limit: batch,
+                    max_id: 0,
+                    min_id,
+                    hash: 0,
+                })
+                .await;
+            match r {
+                Err(grammers_client::InvocationError::Read(_)) if attempt < 3 => {
+                    attempt += 1;
+                    let delay_ms = 300u64 * (1 << attempt.min(4));
+                    warn!(
+                        "list_channel_videos IO disconnect; retry {}/3 in {}ms",
+                        attempt, delay_ms
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                other => break other,
+            }
+        };
+        let result = result.map_err(|e| format!("GetHistory falló: {}", e))?;
+
+        let messages: &[tl::enums::Message] = match &result {
+            tl::enums::messages::Messages::Messages(m) => &m.messages,
+            tl::enums::messages::Messages::Slice(m) => &m.messages,
+            tl::enums::messages::Messages::ChannelMessages(m) => &m.messages,
+            tl::enums::messages::Messages::NotModified(_) => break,
+        };
+        if messages.is_empty() {
+            break;
+        }
+        for msg in messages {
+            top_id = top_id.max(tl_message_id(msg));
+            if let tl::enums::Message::Message(m) = msg {
+                if let Some(v) = video_from_message(m) {
+                    videos.push(v);
+                }
+            }
+        }
+        scanned += messages.len();
+
+        if messages.len() < batch as usize {
+            break; // reached the oldest message
+        }
+        if scanned >= max_scan {
+            truncated = true;
+            break;
+        }
+        // Next page: ids lower than the smallest id in this batch
+        offset_id = messages.iter().map(tl_message_id).min().unwrap_or(0);
+        if offset_id == 0 {
+            break;
+        }
+    }
+
+    videos.sort_by_key(|v| v.id);
+    info!(
+        "Listed {} video(s) in chat {} (min_id={}, scanned={}, top_id={})",
+        videos.len(),
+        chat_id,
+        min_id,
+        scanned,
+        top_id
+    );
+    Ok(ChannelListing {
+        videos,
+        top_id,
+        scanned,
+        truncated,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Streaming helpers
 // ---------------------------------------------------------------------------
 

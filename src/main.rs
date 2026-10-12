@@ -306,7 +306,8 @@ async fn main() -> std::io::Result<()> {
         #[cfg(feature = "telegram")]
         {
             use telegram::handler::{
-                telegram_info_handler, telegram_status_handler, telegram_stream_handler,
+                telegram_info_handler, telegram_list_handler, telegram_status_handler,
+                telegram_stream_handler,
             };
             use telegram::session_gen::{
                 session_2fa_handler, session_cancel_handler, session_start_handler,
@@ -326,6 +327,7 @@ async fn main() -> std::io::Result<()> {
                     )
                     .route("/info", web::get().to(telegram_info_handler))
                     .route("/status", web::get().to(telegram_status_handler))
+                    .route("/list", web::get().to(telegram_list_handler))
                     // Session-generation endpoints — drive the web UI wizard.
                     .route("/session/start", web::post().to(session_start_handler))
                     .route("/session/verify", web::post().to(session_verify_handler))
