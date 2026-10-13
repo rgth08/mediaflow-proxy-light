@@ -711,7 +711,12 @@ pub async fn get_fresh_document_info(
 #[derive(Debug, Clone)]
 pub struct ChannelVideo {
     pub id: i32,
+    /// Best title: caption's first line when present, else the file name, else `mensaje-<id>`.
     pub name: String,
+    /// File name attribute of the document (empty when Telegram did not store one).
+    pub file_name: String,
+    /// First line of the message caption (empty when there is none).
+    pub caption: String,
     pub size: i64,
     pub duration: i64,
     pub date: i32,
@@ -777,20 +782,21 @@ fn video_from_message(m: &tl::types::Message) -> Option<ChannelVideo> {
     if !(is_video_mime || ext_ok) {
         return None;
     }
-    let name = file_name
-        .filter(|n| !n.trim().is_empty())
-        .or_else(|| {
-            let first = m.message.lines().next().unwrap_or("").trim().to_string();
-            if first.is_empty() {
-                None
-            } else {
-                Some(first)
-            }
-        })
-        .unwrap_or_else(|| format!("mensaje-{}", m.id));
+    let caption = m.message.lines().next().unwrap_or("").trim().to_string();
+    let file_name = file_name.unwrap_or_default();
+    // An explicit caption wins (it can be edited without re-uploading the video).
+    let name = if !caption.is_empty() {
+        caption.clone()
+    } else if !file_name.trim().is_empty() {
+        file_name.trim().to_string()
+    } else {
+        format!("mensaje-{}", m.id)
+    };
     Some(ChannelVideo {
         id: m.id,
         name,
+        file_name,
+        caption,
         size: doc.size as i64,
         duration,
         date: m.date,

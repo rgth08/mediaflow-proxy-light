@@ -439,6 +439,8 @@ pub async fn telegram_list_handler(
                 serde_json::json!({
                     "id": v.id,
                     "name": v.name,
+                    "file_name": v.file_name,
+                    "caption": v.caption,
                     "size": v.size,
                     "duration": v.duration,
                     "date": v.date,
